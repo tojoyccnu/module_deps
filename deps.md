@@ -35,6 +35,48 @@ inja
 
 jemalloc
 
+
+
+libcgroup
+
+libpcap
+
+libsystemd
+
+libunwind
+
+libzip
+
+lua
+
+lz4
+
+miniupnp
+
+netevent
+
+nginx
+
+njs
+
+nlohmann_json
+
+openresty
+
+openssl
+
+pcre
+
+postgresql
+
+protobuf
+
+pupnp
+
+re2
+
+Redis Plus Plus
+
 jsoncpp
 
 libarchive
