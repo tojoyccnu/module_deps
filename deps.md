@@ -81,3 +81,18 @@ jsoncpp
 
 libarchive
 
+seastar
+
+soci
+
+sqlite
+
+trantor
+
+upa
+
+valkey
+
+yaml-cpp
+
+zlib
