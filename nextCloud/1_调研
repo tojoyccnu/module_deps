@@ -1,1 +1,251 @@
 
+概念和阶段说明
+阶段
+描述
+UNSPECIFIED
+未指定
+STARTING
+初始化同步
+DISCOVERY
+扫描本地和远端变化
+RECONCILE
+对比差异并生成同步计划
+PROPAGATION
+执行上传、下载、删除、重命名
+DONE
+同步结束
+这两个阶段的边界可以这样理解：
+阶段
+主要做什么
+产物
+DISCOVERY
+收集事实：扫描本地、查询远端、读取 journal，把三方状态合并比较
+一批 SyncFileItem，每个 item 已有初步方向/指令
+RECONCILE
+审核和调整计划：基于 discovery 结果处理全局规则、风险场景和传播前准备
+最终可执行的同步计划
+DISCOVERY 是“发现差异”的阶段。
+它会递归处理目录：
+● 远端通过 PROPFIND 获取目录项、etag、fileId、mtime、size。
+● 本地扫描文件系统，获取文件是否存在、mtime、size、类型。
+● journal 提供上一次同步基线。
+● 对每个文件/目录判断是新增、修改、删除、重命名、冲突、忽略。
+例如：
+● 只本地变了 -> 生成 upload item
+● 只远端变了 -> 生成 download item
+● 本地和远端都变了 -> 生成 conflict item
+● 目录 etag 没变 -> 远端子树可跳过
+RECONCILE 是“传播前整理”的阶段。
+在 NextCloud 里，Discovery 结束后进入 slotDiscoveryFinished()，然后设置：
+_progressInfo->_status = ProgressInfo::Reconcile;
+之后会做一些全局判断和传播前处理，例如：
+● discovery 结果是否不完整，是否需要下一轮 sync。
+● 是否触发大规模删除保护。
+● 是否处理只读目录残留。
+● 是否处理 server restore 旧版本场景。
+● 发出 aboutToPropagate(syncItems)，让外部有机会检查/调整即将传播的 item。
+● 提交 journal，然后创建 OwncloudPropagator。
+所以边界是：
+Discovery 结束的边界：已经完成本地/远端/journal 三方扫描与逐项差异判断。
+Reconcile 结束的边界：同步计划已经通过全局规则检查，准备交给 Propagator 真正执行。
+一句话版：
+● DISCOVERY：找出“发生了什么变化”。
+● RECONCILE：决定“这些变化最终该怎么执行”。
+ 模块同步架构流程
+1. 同步模块架构图
+2. 同步任务调度与启动交互图
+3. 同步运行主流程交互图
+4. 变更发现核心业务流程图
+5. 传播写入与服务端条件保护图
+6. 冲突检测与解决核心业务图
+7. 简化版总览图
+适合放在文档开头做概览。
+源码锚点
+模块
+源码位置
+说明
+远端 root etag 快速探测
+src/gui/folder.cpp:399
+请求 root etag，变化则调度同步
+启动同步与发现模式选择
+src/gui/folder.cpp:1161
+选择 full / partial / single item local discovery
+调度队列与单同步限制
+src/gui/folderman.cpp:996、src/gui/folderman.cpp:1046
+延迟启动，避免并发同步
+SyncEngine 启动
+src/libsync/syncengine.cpp:487
+检查环境、打开 journal、进入 Discovery
+Discovery 目录任务
+src/libsync/discovery.cpp:77
+根据 QueryMode 决定是否查 local/server
+三方 entries 合并
+src/libsync/discovery.cpp:110
+合并 server/local/db entries 后逐项分析
+远端 PROPFIND
+src/libsync/discoveryphase.cpp:441
+LsColJob 查询目录属性
+目录 etag 剪枝
+src/libsync/discovery.cpp:1298
+etag/权限未变则子目录远端 ParentNotChanged
+本地局部发现决策
+src/libsync/syncengine.cpp:1343
+watcher 路径、父路径和子路径参与本地扫描
+冲突检测
+src/libsync/discovery.cpp:1413、src/libsync/discovery.cpp:1754
+本地和远端都变化则冲突
+传播阶段
+src/libsync/syncengine.cpp:1045
+aboutToPropagate 后创建 OwncloudPropagator
+条件上传
+src/libsync/propagateupload.cpp:791
+更新已有文件时发送 If-Match
+冲突记录
+src/libsync/owncloudpropagator.cpp:959、src/common/syncjournaldb.cpp:2682
+创建冲突副本并写 conflicts 表
+冲突解决
+src/gui/conflictsolver.cpp:44
+KeepLocal / KeepRemote / KeepBoth
+
+“远端从 root etag 开始，再逐层比较子目录 etag”大方向接近，但要补两点：
+1. 不是 local root_etag vs remote root_etagNextCloud 本地侧没有一个等价的 root_etag。本地变化靠文件系统扫描、watcher 记录的局部路径、以及 sync journal 里的历史记录判断。远端才主要靠 WebDAV PROPFIND 返回的目录/文件 getetag。
+2. root etag 主要先用于判断是否需要启动同步Folder::slotRunEtagJob() 会请求远端 root 的 etag，如果和 _lastEtag 不同，就调度该 Folder 同步：[folder.cpp (line 399)](/data/huatao/workspace/nextCloud_desktop/src/gui/folder.cpp:399)。同步过程中拿到的 root etag 会回写 _lastEtag：[folder.cpp (line 440)](/data/huatao/workspace/nextCloud_desktop/src/gui/folder.cpp:440)。
+实际 discovery 流程更像这样：
+1. 启动同步后创建 ProcessDirectoryJob，从根目录开始：[syncengine.cpp (line 713)](/data/huatao/workspace/nextCloud_desktop/src/libsync/syncengine.cpp:713)
+2. 对当前目录同时做两类查询：
+    ○ 远端：DiscoverySingleDirectoryJob 发 WebDAV PROPFIND：[discovery.cpp (line 2301)](/data/huatao/workspace/nextCloud_desktop/src/libsync/discovery.cpp:2301)
+    ○ 本地：DiscoverySingleLocalDirectoryJob 扫本地目录：[discovery.cpp (line 2393)](/data/huatao/workspace/nextCloud_desktop/src/libsync/discovery.cpp:2393)
+3. process() 把远端 entries、本地 entries、journal DB entries 合并到同一个 map，再逐项分析：[discovery.cpp (line 110)](/data/huatao/workspace/nextCloud_desktop/src/libsync/discovery.cpp:110)
+4. 如果某个远端目录的 serverEntry.etag == dbEntry._etag 且权限没变，就认为该远端目录未变化，子目录远端查询模式设为 ParentNotChanged，不会继续 PROPFIND 该目录内部：[discovery.cpp (line 1298)](/data/huatao/workspace/nextCloud_desktop/src/libsync/discovery.cpp:1298)
+5. 如果目录 etag 变了，才继续对子目录做远端查询，一层层向下展开。
+6. 文件级判断时，如果 DB etag 和远端 etag 不同，就认为远端文件变化，生成下载/更新类指令：[discovery.cpp (line 855)](/data/huatao/workspace/nextCloud_desktop/src/libsync/discovery.cpp:855)
+7. 本地侧是否扫描由 LocalDiscoveryStyle 决定：全量时所有目录都扫；局部时只扫 watcher 记录路径、其父路径和子路径：[syncengine.cpp (line 1343)](/data/huatao/workspace/nextCloud_desktop/src/libsync/syncengine.cpp:1343)
+所以结论是：
+远端变更发现确实是从 root PROPFIND/root etag 开始，利用目录 etag 做逐层剪枝；但完整变更检测不是单纯 local/remote etag 对比，而是“远端 PROPFIND + 本地扫描/局部扫描 + journal 历史状态”的三方合并对比。
+NextCloud 业务冲突判定机制
+1. 总体原则
+业务冲突判定主要在客户端做，而非 server 端集中判定。
+
+2. 为什么冲突判定在客户端？
+冲突判定依赖客户端独有的三方状态：
+维度
+数据来源
+关键字段
+本地当前状态
+客户端本地文件系统
+文件是否修改、mtime、size、checksum
+远端当前状态
+通过 PROPFIND 获取
+etag、fileId、mtime、size
+本地基线（上次同步快照）
+客户端本地 journal / DB
+旧 etag、旧 mtime、旧 fileId
+这三方信息只有客户端本地最完整，服务端无法同时看到"客户端本地文件"和"客户端 journal 基线"，因此冲突判定自然落在客户端。
+
+3. 客户端判定流程
+冲突判定发生在 Desktop 客户端的 discovery 阶段：
+● 函数 processFileConflict() 基于本地状态、远端状态、DB 基线三方比较，生成指令 CSYNC_INSTRUCTION_CONFLICT。
+
+4. 服务端的职责
+服务端虽不负责完整判冲突，但需做并发一致性保护，核心机制是 etag 条件检查。
+4.1 上传时的 etag Checksum 校验
+● 客户端上传已有文件时，请求携带 header：
+If-Match: "<etag>"
+
+语义：只有远端当前 etag 仍等于客户端 discovery 时获取到的 etag，才允许覆盖写入。
+参考：bulkpropagatorjob.cpp (line 644)
+● 若服务端发现 etag 已变更，返回 412 Precondition Failed。
+● 客户端收到 412 后，知晓远端在 discovery 之后又被其他客户端修改，下一轮同步将重新 discovery / 转成冲突处理。
+4.2 冲突文件的上传标识
+当客户端已经创建了冲突副本，上传冲突文件时会携带特殊 header，使服务端识别这是一个 conflict file（而非普通文件）：
+Header
+含义
+OC-Conflict
+标记为冲突文件
+OC-ConflictBaseFileId
+冲突所基于的原始文件 ID
+OC-ConflictBaseEtag
+冲突所基于的原始文件 etag
+参考：bulkpropagatorjob.cpp (line 652)
+
+5. 分工总结
+
+客户端
+服务端
+发现变更
+✅
+—
+判断是否冲突
+✅
+—
+生成冲突文件
+✅
+—
+维护本地 conflict record
+✅
+—
+提供 etag / fileId / mtime / size 等元数据
+—
+✅
+写入时执行 If-Match / 锁 / 权限等校验
+—
+✅
+保存或识别客户端上传的 conflict file 元信息
+—
+✅
+核心结论：服务端不负责完整替客户端判断"local 与 remote 是否冲突"，因为它看不到客户端本地文件和客户端 journal 基线。
+
+附录
+1、词汇
+文件同步/数据同步（常见于云盘、代码仓库、备份软件）的标准状态术语。下面按流程顺序为你详细解释：
+1. UNSPECIFIED
+字面意思：未指定的；未说明的
+在同步中的含义：这是一个兜底状态。通常表示同步任务刚刚创建，或者系统还没有获取到足够的状态信息来确定它具体处于哪个阶段。你可以把它理解为“未知状态”。
+2. STARTING
+字面意思：启动中；开始
+在同步中的含义：初始化阶段。程序正在准备资源，比如建立网络连接、验证账号密码、加载配置文件、锁定同步文件夹等。就像汽车点火，还没挂挡起步。
+3. DISCOVERY
+字面意思：发现；探测
+在同步中的含义：扫描阶段。这是同步的关键一步。软件会同时扫描（或索引）：
+本地：查看哪些文件是新添加的、哪些被修改了、哪些被删除了。
+远端（服务器/对方设备）：同样检查云端或其他设备上的文件变化。
+此时它只是在“看”，并没有开始传输数据。
+4. RECONCILE
+字面意思：调和；对账；调解分歧
+在同步中的含义：决策阶段。这是最体现同步逻辑的地方。软件将“Discovery”阶段收集到的两边的变化进行对比，解决冲突，并制定具体的行动计划。
+例子：如果本地修改了A文件，远端也修改了A文件，这里就要决定是覆盖、合并还是提示用户手动解决冲突。
+结果：生成一个详细的“同步计划”（Sync Plan），比如“上传A文件”、“下载B文件夹”、“删除本地的C文件”。
+5. PROPAGATION
+字面意思：传播；扩散
+在同步中的含义：执行阶段。这是真正干活的阶段。软件严格按照“Reconcile”生成的计划，执行具体的I/O操作：
+上传（Upload）
+下载（Download）
+删除（Delete）
+重命名（Rename）
+这个阶段通常会显示实时网速和进度条。
+6. DONE
+字面意思：完成
+在同步中的含义：结束状态。表示本次同步任务的所有计划操作都已成功执行完毕。两边的文件现在是一致的。通常会有“Up to date”（最新）的提示。
+💡 总结一下这个流程：
+整个过程就像整理两个乱了的文件夹：
+UNSPECIFIED：还没想好怎么弄。
+STARTING：坐下，打开台灯，准备好笔和纸。
+DISCOVERY：分别翻看两个文件夹里都有啥，记在纸上（有哪些新增、修改、删除）。
+RECONCILE：对比两张纸的记录，决定具体怎么做（比如：左边多的放右边，右边多的放左边，相同的跳过）。
+PROPAGATION：动手搬文件、删文件、改文件名。
+DONE：搞定！两个文件夹一模一样了。
+6、冲突判定
+
+NextCloud 的业务冲突判定主要在客户端做，不是在 server 端集中做。
+原因是“冲突”依赖客户端三方状态：
+本地当前状态：文件是否改了、mtime/size/checksum
+远端当前状态：PROPFIND 拿到的 etag/fileId/mtime/size
+本地 journal 里的上次同步基线：旧 etag、旧 mtime、旧 fileId
+这些信息只有客户端最完整。所以普通冲突是在 Desktop 的 discovery 阶段判断的，例如 processFileConflict() 会基于本地、远端、DB 三方比较生成 CSYNC_INSTRUCTION_CONFLICT。
+但 server 端仍然要做并发一致性保护，主要是 etag 条件检查：
+客户端上传已有文件时会带 If-Match: ""，表示“只有远端当前 etag 仍等于我发现时的 etag 才允许覆盖”：bulkpropagatorjob.cpp (line 644)如果 server 发现 etag 已经变了，就应返回 412 Precondition Failed
+客户端收到 412 后会知道远端在 discovery 之后又变了，下一轮同步再重新发现/转成冲突处理
+另外，如果客户端已经创建了冲突副本，上传冲突文件时会带 OC-Conflict、OC-ConflictBaseFileId、OC-ConflictBaseEtag 等 header，让 server 知道这是一个 conflict file，而不是普通文件：bulkpropagatorjob.cpp (line 652)所以更准确的分工是：
+客户端：发现变更、判断是否冲突、生成冲突文件、维护本地 conflict record。
+服务端：提供 etag/fileId/mtime/size 等元数据；在写入时执行 If-Match/锁/权限等校验；可保存或识别客户端上传的 conflict file 元信息。
+服务端不负责完整替客户端判断“local 与 remote 是否冲突”，因为它看不到客户端本地文件和客户端 journal 基线。
